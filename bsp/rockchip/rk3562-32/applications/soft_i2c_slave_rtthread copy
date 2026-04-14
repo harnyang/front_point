@@ -1,0 +1,725 @@
+#include <rtthread.h>
+#include <rthw.h>
+#include <rtdevice.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*
+ * Public API:
+ *   typedef struct rk_soft_i2c_slave_cfg rk_soft_i2c_slave_cfg_t;
+ *   typedef struct rk_soft_i2c_slave_frame rk_soft_i2c_slave_frame_t;
+ *   typedef void (*rk_soft_i2c_slave_rx_cb_t)(const rk_soft_i2c_slave_frame_t *frame, void *user_data);
+ *
+ *   rt_err_t rk_soft_i2c_slave_init(const rk_soft_i2c_slave_cfg_t *cfg);
+ *   void     rk_soft_i2c_slave_deinit(void);
+ *   rt_bool_t rk_soft_i2c_slave_is_ready(void);
+ *   rt_err_t rk_soft_i2c_slave_register_rx_callback(rk_soft_i2c_slave_rx_cb_t cb, void *user_data);
+ *   const rk_soft_i2c_slave_frame_t *rk_soft_i2c_slave_get_last_frame(void);
+ *
+ * Other files can use the APIs above with extern declarations.
+ */
+
+#define RK_SOFT_I2C_SLAVE_NAME             "si2cs"
+#define RK_SOFT_I2C_SLAVE_WORKER_NAME      "si2cs_w"
+#define RK_SOFT_I2C_SLAVE_MAX_ADDRS        4
+#define RK_SOFT_I2C_SLAVE_MAX_DATA_LEN     256
+#define RK_SOFT_I2C_SLAVE_QUEUE_DEPTH      8
+#define RK_SOFT_I2C_SLAVE_EVENT_RX         (1UL << 0)
+
+typedef struct rk_soft_i2c_slave_frame
+{
+    rt_uint8_t dev_addr;
+    rt_uint8_t reg_addr;
+    rt_uint16_t data_len;
+    rt_uint8_t data[RK_SOFT_I2C_SLAVE_MAX_DATA_LEN];
+    rt_tick_t tick;
+    rt_uint8_t overflow;
+} rk_soft_i2c_slave_frame_t;
+
+typedef struct rk_soft_i2c_slave_cfg
+{
+    rt_base_t scl_pin;
+    rt_base_t sda_pin;
+    rt_uint8_t addr[RK_SOFT_I2C_SLAVE_MAX_ADDRS];
+    rt_uint8_t addr_num;
+    rt_uint16_t max_data_len;
+    rt_uint16_t worker_stack_size;
+    rt_uint8_t worker_priority;
+    rt_uint32_t worker_tick;
+} rk_soft_i2c_slave_cfg_t;
+
+typedef void (*rk_soft_i2c_slave_rx_cb_t)(const rk_soft_i2c_slave_frame_t *frame, void *user_data);
+
+typedef enum
+{
+    RK_I2C_BUS_IDLE = 0,
+    RK_I2C_BUS_ADDRESS,
+    RK_I2C_BUS_RECEIVE,
+    RK_I2C_BUS_IGNORE,
+} rk_i2c_bus_state_t;
+
+typedef enum
+{
+    RK_I2C_ACK_NONE = 0,
+    RK_I2C_ACK_ARMED,
+    RK_I2C_ACK_ACTIVE,
+} rk_i2c_ack_state_t;
+
+typedef struct rk_soft_i2c_slave_ctx
+{
+    rk_soft_i2c_slave_cfg_t cfg;
+    rt_bool_t ready;
+
+    volatile rt_uint8_t prev_scl;
+    volatile rt_uint8_t prev_sda;
+    volatile rt_uint8_t shift_reg;
+    volatile rt_uint8_t bit_count;
+    volatile rt_uint8_t addr_rw;
+    volatile rt_uint8_t transfer_active;
+    volatile rt_uint8_t reg_received;
+
+    volatile rk_i2c_bus_state_t state;
+    volatile rk_i2c_ack_state_t ack_state;
+    volatile rt_uint8_t ack_level;
+
+
+    rk_soft_i2c_slave_frame_t cur_frame;
+    rk_soft_i2c_slave_frame_t last_frame;
+    rk_soft_i2c_slave_frame_t queue[RK_SOFT_I2C_SLAVE_QUEUE_DEPTH];
+    volatile rt_uint8_t queue_head;
+    volatile rt_uint8_t queue_tail;
+    volatile rt_uint8_t queue_count;
+
+    rt_event_t evt;
+    rt_thread_t worker;
+    rk_soft_i2c_slave_rx_cb_t rx_cb;
+    void *rx_user_data;
+} rk_soft_i2c_slave_ctx_t;
+
+static rk_soft_i2c_slave_ctx_t g_i2c_slave;
+
+RT_WEAK void rk_soft_i2c_slave_todo_send_to_linux(const rk_soft_i2c_slave_frame_t *frame)
+{
+    rt_uint16_t i;
+
+    if (frame == RT_NULL)
+    {
+        return;
+    }
+
+    rt_kprintf("[si2cs] addr=0x%02x reg=0x%02x len=%u overflow=%u tick=%u\n",
+               frame->dev_addr,
+               frame->reg_addr,
+               frame->data_len,
+               frame->overflow,
+               (unsigned int)frame->tick);
+
+    if (frame->data_len == 0)
+    {
+        rt_kprintf("[si2cs] data: <empty>\n");
+        return;
+    }
+
+    rt_kprintf("[si2cs] data:");
+    for (i = 0; i < frame->data_len; i++)
+    {
+        rt_kprintf(" %02x", frame->data[i]);
+    }
+    rt_kprintf("\n");
+}
+
+static rt_bool_t rk_soft_i2c_slave_addr_match(rt_uint8_t addr_byte)
+{
+    rt_uint8_t i;
+    rt_uint8_t addr_7bit_shifted;
+
+    addr_7bit_shifted = (rt_uint8_t)(addr_byte & 0xFE);
+    for (i = 0; i < g_i2c_slave.cfg.addr_num; i++)
+    {
+        if (g_i2c_slave.cfg.addr[i] == addr_7bit_shifted)
+        {
+            return RT_TRUE;
+        }
+    }
+
+    return RT_FALSE;
+}
+
+rt_inline void rk_soft_i2c_slave_sda_release(void)
+{
+    rt_pin_mode(g_i2c_slave.cfg.sda_pin, PIN_MODE_INPUT_PULLUP);
+}
+
+rt_inline void rk_soft_i2c_slave_sda_drive_low(void)
+{
+    rt_pin_mode(g_i2c_slave.cfg.sda_pin, PIN_MODE_OUTPUT_OD);
+    rt_pin_write(g_i2c_slave.cfg.sda_pin, PIN_LOW);
+}
+
+static void rk_soft_i2c_slave_reset_transfer(void)
+{
+    g_i2c_slave.state = RK_I2C_BUS_IDLE;
+    g_i2c_slave.ack_state = RK_I2C_ACK_NONE;
+    g_i2c_slave.ack_level = PIN_HIGH;
+    g_i2c_slave.shift_reg = 0;
+    g_i2c_slave.bit_count = 0;
+    g_i2c_slave.addr_rw = 0;
+    g_i2c_slave.transfer_active = 0;
+    g_i2c_slave.reg_received = 0;
+    g_i2c_slave.cur_frame.dev_addr = 0;
+    g_i2c_slave.cur_frame.reg_addr = 0;
+    g_i2c_slave.cur_frame.data_len = 0;
+    g_i2c_slave.cur_frame.tick = 0;
+    g_i2c_slave.cur_frame.overflow = 0;
+    rk_soft_i2c_slave_sda_release();
+}
+
+static void rk_soft_i2c_slave_queue_frame(const rk_soft_i2c_slave_frame_t *frame)
+{
+    rt_base_t level;
+
+    level = rt_hw_interrupt_disable();
+    if (g_i2c_slave.queue_count < RK_SOFT_I2C_SLAVE_QUEUE_DEPTH)
+    {
+        g_i2c_slave.queue[g_i2c_slave.queue_head] = *frame;
+        g_i2c_slave.queue_head = (rt_uint8_t)((g_i2c_slave.queue_head + 1) % RK_SOFT_I2C_SLAVE_QUEUE_DEPTH);
+        g_i2c_slave.queue_count++;
+        g_i2c_slave.last_frame = *frame;
+        rt_hw_interrupt_enable(level);
+        rt_event_send(g_i2c_slave.evt, RK_SOFT_I2C_SLAVE_EVENT_RX);
+        return;
+    }
+    rt_hw_interrupt_enable(level);
+
+    /* Drop silently to keep IRQ path short. */
+}
+
+static void rk_soft_i2c_slave_finalize_frame(void)
+{
+    if (!g_i2c_slave.transfer_active)
+    {
+        return;
+    }
+
+    if (g_i2c_slave.cur_frame.data_len > 0)
+    {
+        g_i2c_slave.cur_frame.tick = rt_tick_get();
+        rk_soft_i2c_slave_queue_frame(&g_i2c_slave.cur_frame);
+    }
+}
+
+static void rk_soft_i2c_slave_prepare_ack(rt_uint8_t ack_level)
+{
+    g_i2c_slave.ack_level = ack_level;
+    g_i2c_slave.ack_state = RK_I2C_ACK_ARMED;
+}
+
+static void rk_soft_i2c_slave_on_start(void)
+{
+    rk_soft_i2c_slave_finalize_frame();
+
+    g_i2c_slave.state = RK_I2C_BUS_ADDRESS;
+    g_i2c_slave.ack_state = RK_I2C_ACK_NONE;
+    g_i2c_slave.ack_level = PIN_HIGH;
+    g_i2c_slave.shift_reg = 0;
+    g_i2c_slave.bit_count = 0;
+    g_i2c_slave.addr_rw = 0;
+    g_i2c_slave.transfer_active = 0;
+    g_i2c_slave.reg_received = 0;
+    g_i2c_slave.cur_frame.dev_addr = 0;
+    g_i2c_slave.cur_frame.reg_addr = 0;
+    g_i2c_slave.cur_frame.data_len = 0;
+    g_i2c_slave.cur_frame.tick = 0;
+    g_i2c_slave.cur_frame.overflow = 0;
+    rk_soft_i2c_slave_sda_release();
+}
+
+static void rk_soft_i2c_slave_on_stop(void)
+{
+    rk_soft_i2c_slave_finalize_frame();
+    rk_soft_i2c_slave_reset_transfer();
+}
+
+static void rk_soft_i2c_slave_handle_byte(rt_uint8_t byte)
+{
+    if (g_i2c_slave.state == RK_I2C_BUS_ADDRESS)
+    {
+        g_i2c_slave.addr_rw = (rt_uint8_t)(byte & 0x01);
+
+        if (!rk_soft_i2c_slave_addr_match(byte))
+        {
+            g_i2c_slave.state = RK_I2C_BUS_IGNORE;
+            rk_soft_i2c_slave_prepare_ack(PIN_HIGH);
+            return;
+        }
+
+        if (g_i2c_slave.addr_rw != 0)
+        {
+            /* Current version only handles master-write / slave-receive. */
+            g_i2c_slave.state = RK_I2C_BUS_IGNORE;
+            rk_soft_i2c_slave_prepare_ack(PIN_HIGH);
+            return;
+        }
+
+        g_i2c_slave.cur_frame.dev_addr = (rt_uint8_t)(byte & 0xFE);
+        g_i2c_slave.state = RK_I2C_BUS_RECEIVE;
+        g_i2c_slave.transfer_active = 1;
+        rk_soft_i2c_slave_prepare_ack(PIN_LOW);
+        return;
+    }
+
+    if (g_i2c_slave.state != RK_I2C_BUS_RECEIVE)
+    {
+        return;
+    }
+
+    if (!g_i2c_slave.reg_received)
+    {
+        g_i2c_slave.cur_frame.reg_addr = byte;
+        g_i2c_slave.reg_received = 1;
+        rk_soft_i2c_slave_prepare_ack(PIN_LOW);
+        return;
+    }
+
+    if (g_i2c_slave.cur_frame.data_len < g_i2c_slave.cfg.max_data_len)
+    {
+        g_i2c_slave.cur_frame.data[g_i2c_slave.cur_frame.data_len] = byte;
+        g_i2c_slave.cur_frame.data_len++;
+        rk_soft_i2c_slave_prepare_ack(PIN_LOW);
+        return;
+    }
+
+    g_i2c_slave.cur_frame.overflow = 1;
+    g_i2c_slave.state = RK_I2C_BUS_IGNORE;
+    rk_soft_i2c_slave_prepare_ack(PIN_HIGH);
+}
+
+static void rk_soft_i2c_slave_handle_scl_rising(rt_uint8_t sda_level)
+{
+    if (g_i2c_slave.ack_state == RK_I2C_ACK_ACTIVE)
+    {
+        return;
+    }
+
+    if (g_i2c_slave.state != RK_I2C_BUS_ADDRESS &&
+        g_i2c_slave.state != RK_I2C_BUS_RECEIVE)
+    {
+        return;
+    }
+
+    g_i2c_slave.shift_reg = (rt_uint8_t)((g_i2c_slave.shift_reg << 1) | (sda_level & 0x01));
+    g_i2c_slave.bit_count++;
+
+    if (g_i2c_slave.bit_count == 8)
+    {
+        rk_soft_i2c_slave_handle_byte(g_i2c_slave.shift_reg);
+        g_i2c_slave.shift_reg = 0;
+        g_i2c_slave.bit_count = 0;
+    }
+}
+
+static void rk_soft_i2c_slave_handle_scl_falling(void)
+{
+    if (g_i2c_slave.ack_state == RK_I2C_ACK_ARMED)
+    {
+        if (g_i2c_slave.ack_level == PIN_LOW)
+        {
+            rk_soft_i2c_slave_sda_drive_low();
+        }
+        else
+        {
+            rk_soft_i2c_slave_sda_release();
+        }
+        g_i2c_slave.ack_state = RK_I2C_ACK_ACTIVE;
+        return;
+    }
+
+    if (g_i2c_slave.ack_state == RK_I2C_ACK_ACTIVE)
+    {
+        rk_soft_i2c_slave_sda_release();
+        g_i2c_slave.ack_state = RK_I2C_ACK_NONE;
+    }
+}
+
+static void rk_soft_i2c_slave_irq_common(void)
+{
+    rt_uint8_t scl_now;
+    rt_uint8_t sda_now;
+    rt_uint8_t prev_scl;
+    rt_uint8_t prev_sda;
+
+    if (!g_i2c_slave.ready)
+    {
+        return;
+    }
+
+    scl_now = (rt_uint8_t)rt_pin_read(g_i2c_slave.cfg.scl_pin);
+    sda_now = (rt_uint8_t)rt_pin_read(g_i2c_slave.cfg.sda_pin);
+    prev_scl = g_i2c_slave.prev_scl;
+    prev_sda = g_i2c_slave.prev_sda;
+
+    if ((prev_sda == PIN_HIGH) && (sda_now == PIN_LOW) && (scl_now == PIN_HIGH))
+    {
+        rk_soft_i2c_slave_on_start();
+    }
+    else if ((prev_sda == PIN_LOW) && (sda_now == PIN_HIGH) && (scl_now == PIN_HIGH))
+    {
+        rk_soft_i2c_slave_on_stop();
+    }
+    else
+    {
+        if ((prev_scl == PIN_LOW) && (scl_now == PIN_HIGH))
+        {
+            rk_soft_i2c_slave_handle_scl_rising(sda_now);
+        }
+        else if ((prev_scl == PIN_HIGH) && (scl_now == PIN_LOW))
+        {
+            rk_soft_i2c_slave_handle_scl_falling();
+        }
+    }
+
+    g_i2c_slave.prev_scl = scl_now;
+    g_i2c_slave.prev_sda = sda_now;
+}
+
+static void rk_soft_i2c_slave_scl_irq(void *args)
+{
+    RT_UNUSED(args);
+    rk_soft_i2c_slave_irq_common();
+}
+
+static void rk_soft_i2c_slave_sda_irq(void *args)
+{
+    RT_UNUSED(args);
+    rk_soft_i2c_slave_irq_common();
+}
+
+static void rk_soft_i2c_slave_worker(void *parameter)
+{
+    rt_uint32_t recv_set;
+
+    RT_UNUSED(parameter);
+
+    while (g_i2c_slave.ready)
+    {
+        if (rt_event_recv(g_i2c_slave.evt,
+                          RK_SOFT_I2C_SLAVE_EVENT_RX,
+                          RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                          RT_WAITING_FOREVER,
+                          &recv_set) != RT_EOK)
+        {
+            continue;
+        }
+
+        while (1)
+        {
+            rk_soft_i2c_slave_frame_t frame;
+            rt_base_t level;
+
+            level = rt_hw_interrupt_disable();
+            if (g_i2c_slave.queue_count == 0)
+            {
+                rt_hw_interrupt_enable(level);
+                break;
+            }
+
+            frame = g_i2c_slave.queue[g_i2c_slave.queue_tail];
+            g_i2c_slave.queue_tail = (rt_uint8_t)((g_i2c_slave.queue_tail + 1) % RK_SOFT_I2C_SLAVE_QUEUE_DEPTH);
+            g_i2c_slave.queue_count--;
+            rt_hw_interrupt_enable(level);
+
+            if (g_i2c_slave.rx_cb)
+            {
+                g_i2c_slave.rx_cb(&frame, g_i2c_slave.rx_user_data);
+            }
+
+            rk_soft_i2c_slave_todo_send_to_linux(&frame);
+        }
+    }
+}
+
+static void rk_soft_i2c_slave_fill_default_cfg(rk_soft_i2c_slave_cfg_t *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    // cfg->scl_pin = -1;
+    // cfg->sda_pin = -1;
+    cfg->scl_pin = 17 + 32; // c1
+    cfg->sda_pin = 18 + 32; // c2
+    cfg->addr[0] = 0x70;
+    cfg->addr[1] = 0x60;
+    cfg->addr_num = 2;
+    cfg->max_data_len = RK_SOFT_I2C_SLAVE_MAX_DATA_LEN;
+    cfg->worker_stack_size = 1024;
+    cfg->worker_priority = 8;
+    cfg->worker_tick = 5;
+}
+
+rt_bool_t rk_soft_i2c_slave_is_ready(void)
+{
+    return g_i2c_slave.ready;
+}
+
+const rk_soft_i2c_slave_frame_t *rk_soft_i2c_slave_get_last_frame(void)
+{
+    return &g_i2c_slave.last_frame;
+}
+
+rt_err_t rk_soft_i2c_slave_register_rx_callback(rk_soft_i2c_slave_rx_cb_t cb, void *user_data)
+{
+    g_i2c_slave.rx_cb = cb;
+    g_i2c_slave.rx_user_data = user_data;
+    return RT_EOK;
+}
+
+rt_err_t rk_soft_i2c_slave_init(const rk_soft_i2c_slave_cfg_t *cfg);
+
+rt_err_t rk_soft_i2c_slave_start_default(void)
+{
+    return rk_soft_i2c_slave_init(RT_NULL);
+}
+
+rt_err_t rk_soft_i2c_slave_init(const rk_soft_i2c_slave_cfg_t *cfg)
+{
+    rk_soft_i2c_slave_cfg_t local_cfg;
+    rt_err_t ret;
+
+    if (g_i2c_slave.ready)
+    {
+        return -RT_EBUSY;
+    }
+
+    rk_soft_i2c_slave_fill_default_cfg(&local_cfg);
+    if (cfg != RT_NULL)
+    {
+        local_cfg = *cfg;
+        if (local_cfg.addr_num == 0)
+        {
+            local_cfg.addr[0] = 0x70;
+            local_cfg.addr[1] = 0x60;
+            local_cfg.addr_num = 2;
+        }
+        if (local_cfg.max_data_len == 0 || local_cfg.max_data_len > RK_SOFT_I2C_SLAVE_MAX_DATA_LEN)
+        {
+            local_cfg.max_data_len = RK_SOFT_I2C_SLAVE_MAX_DATA_LEN;
+        }
+        if (local_cfg.worker_stack_size == 0)
+        {
+            local_cfg.worker_stack_size = 1024;
+        }
+        if (local_cfg.worker_priority == 0)
+        {
+            local_cfg.worker_priority = 8;
+        }
+        if (local_cfg.worker_tick == 0)
+        {
+            local_cfg.worker_tick = 5;
+        }
+    }
+
+    if (local_cfg.scl_pin < 0 || local_cfg.sda_pin < 0)
+    {
+        rt_kprintf("[%s] invalid pin config, please set scl_pin/sda_pin.\n", RK_SOFT_I2C_SLAVE_NAME);
+        return -RT_EINVAL;
+    }
+
+    memset(&g_i2c_slave, 0, sizeof(g_i2c_slave));
+    g_i2c_slave.cfg = local_cfg;
+
+    g_i2c_slave.evt = rt_event_create(RK_SOFT_I2C_SLAVE_NAME, RT_IPC_FLAG_FIFO);
+    if (g_i2c_slave.evt == RT_NULL)
+    {
+        return -RT_ENOMEM;
+    }
+    /* set pin mode */
+    rt_pin_mode(g_i2c_slave.cfg.scl_pin, PIN_MODE_INPUT_PULLUP);
+    rk_soft_i2c_slave_sda_release();
+    
+    /* initialize pin state */
+    g_i2c_slave.prev_scl = (rt_uint8_t)rt_pin_read(g_i2c_slave.cfg.scl_pin);
+    g_i2c_slave.prev_sda = (rt_uint8_t)rt_pin_read(g_i2c_slave.cfg.sda_pin);
+    rk_soft_i2c_slave_reset_transfer();
+
+    ret = rt_pin_attach_irq(g_i2c_slave.cfg.scl_pin,
+                            PIN_IRQ_MODE_RISING_FALLING,
+                            rk_soft_i2c_slave_scl_irq,
+                            RT_NULL);
+    if (ret != RT_EOK)
+    {
+        goto fail;
+    }
+
+    ret = rt_pin_attach_irq(g_i2c_slave.cfg.sda_pin,
+                            PIN_IRQ_MODE_RISING_FALLING,
+                            rk_soft_i2c_slave_sda_irq,
+                            RT_NULL);
+    if (ret != RT_EOK)
+    {
+        rt_pin_detach_irq(g_i2c_slave.cfg.scl_pin);
+        goto fail;
+    }
+
+    g_i2c_slave.worker = rt_thread_create(RK_SOFT_I2C_SLAVE_WORKER_NAME,
+                                          rk_soft_i2c_slave_worker,
+                                          RT_NULL,
+                                          g_i2c_slave.cfg.worker_stack_size,
+                                          g_i2c_slave.cfg.worker_priority,
+                                          g_i2c_slave.cfg.worker_tick);
+    if (g_i2c_slave.worker == RT_NULL)
+    {
+        ret = -RT_ENOMEM;
+        rt_pin_detach_irq(g_i2c_slave.cfg.sda_pin);
+        rt_pin_detach_irq(g_i2c_slave.cfg.scl_pin);
+        goto fail;
+    }
+
+    g_i2c_slave.ready = RT_TRUE;
+    rt_thread_startup(g_i2c_slave.worker);
+
+    ret = rt_pin_irq_enable(g_i2c_slave.cfg.sda_pin, PIN_IRQ_ENABLE);
+    if (ret != RT_EOK)
+    {
+        goto fail_after_thread;
+    }
+
+    ret = rt_pin_irq_enable(g_i2c_slave.cfg.scl_pin, PIN_IRQ_ENABLE);
+    if (ret != RT_EOK)
+    {
+        rt_pin_irq_enable(g_i2c_slave.cfg.sda_pin, PIN_IRQ_DISABLE);
+        goto fail_after_thread;
+    }
+
+    return RT_EOK;
+
+fail_after_thread:
+    g_i2c_slave.ready = RT_FALSE;
+    rt_event_send(g_i2c_slave.evt, RK_SOFT_I2C_SLAVE_EVENT_RX);
+    rt_thread_mdelay(1);
+    if (g_i2c_slave.worker)
+    {
+        rt_thread_delete(g_i2c_slave.worker);
+        g_i2c_slave.worker = RT_NULL;
+    }
+    rt_pin_detach_irq(g_i2c_slave.cfg.sda_pin);
+    rt_pin_detach_irq(g_i2c_slave.cfg.scl_pin);
+fail:
+    if (g_i2c_slave.evt)
+    {
+        rt_event_delete(g_i2c_slave.evt);
+        g_i2c_slave.evt = RT_NULL;
+    }
+    memset(&g_i2c_slave, 0, sizeof(g_i2c_slave));
+    return ret;
+}
+
+void rk_soft_i2c_slave_deinit(void)
+{
+    rt_event_t evt;
+    rt_thread_t worker;
+    rt_base_t scl_pin;
+    rt_base_t sda_pin;
+
+    if (!g_i2c_slave.ready && g_i2c_slave.evt == RT_NULL)
+    {
+        return;
+    }
+
+    scl_pin = g_i2c_slave.cfg.scl_pin;
+    sda_pin = g_i2c_slave.cfg.sda_pin;
+    evt = g_i2c_slave.evt;
+    worker = g_i2c_slave.worker;
+
+    g_i2c_slave.ready = RT_FALSE;
+
+    if (scl_pin >= 0)
+    {
+        rt_pin_irq_enable(scl_pin, PIN_IRQ_DISABLE);
+        rt_pin_detach_irq(scl_pin);
+    }
+    if (sda_pin >= 0)
+    {
+        rt_pin_irq_enable(sda_pin, PIN_IRQ_DISABLE);
+        rt_pin_detach_irq(sda_pin);
+        rt_pin_mode(sda_pin, PIN_MODE_INPUT_PULLUP);
+    }
+
+    if (evt)
+    {
+        rt_event_send(evt, RK_SOFT_I2C_SLAVE_EVENT_RX);
+    }
+
+    rt_thread_mdelay(1);
+
+    if (worker)
+    {
+        rt_thread_delete(worker);
+    }
+
+    if (evt)
+    {
+        rt_event_delete(evt);
+    }
+
+    memset(&g_i2c_slave, 0, sizeof(g_i2c_slave));
+}
+
+/*
+ * Optional MSH helpers for quick bring-up.
+ * Example:
+ *   si2cs_start 17 18
+ *     17/18 should be replaced with your RT-Thread pin IDs.
+ */
+static void si2cs_start(int argc, char **argv)
+{
+    rk_soft_i2c_slave_cfg_t cfg;
+
+    if (argc < 3)
+    {
+        rt_kprintf("usage: si2cs_start <scl_pin> <sda_pin>\n");
+        rt_kprintf("example: si2cs_start 17 18\n");
+        return;
+    }
+
+    rk_soft_i2c_slave_fill_default_cfg(&cfg);
+    cfg.scl_pin = (rt_base_t)atoi(argv[1]);
+    cfg.sda_pin = (rt_base_t)atoi(argv[2]);
+    cfg.scl_pin = 17 + 32; // c1
+    cfg.sda_pin = 18 + 32; // c2
+
+    if (rk_soft_i2c_slave_init(&cfg) != RT_EOK)
+    {
+        rt_kprintf("[%s] start failed.\n", RK_SOFT_I2C_SLAVE_NAME);
+    }
+}
+MSH_CMD_EXPORT(si2cs_start, start software i2c slave receiver);
+
+static void si2cs_stop(int argc, char **argv)
+{
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+    rk_soft_i2c_slave_deinit();
+}
+MSH_CMD_EXPORT(si2cs_stop, stop software i2c slave receiver);
+
+static void si2cs_last(int argc, char **argv)
+{
+    const rk_soft_i2c_slave_frame_t *frame;
+    rt_uint16_t i;
+
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+
+    frame = rk_soft_i2c_slave_get_last_frame();
+    rt_kprintf("addr=0x%02x reg=0x%02x len=%u overflow=%u tick=%u\n",
+               frame->dev_addr,
+               frame->reg_addr,
+               frame->data_len,
+               frame->overflow,
+               (unsigned int)frame->tick);
+
+    for (i = 0; i < frame->data_len; i++)
+    {
+        rt_kprintf("%02x ", frame->data[i]);
+    }
+    rt_kprintf("\n");
+}
+MSH_CMD_EXPORT(si2cs_last, dump last software i2c slave frame);
